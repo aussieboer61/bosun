@@ -1,0 +1,24 @@
+services:
+  bosun:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: bosun
+    restart: unless-stopped
+    ports:
+      - "4080:4080"
+    networks:
+      - revproxy
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /home/sauer/bosun:/home/bosun
+    environment:
+      - TZ=Australia/Brisbane
+      - BOSUN_DATA_DIR=/home/bosun
+      - NODE_ENV=production
+      - JWT_SECRET=bosun_jwt_secret_change_me_in_prod
+
+networks:
+  revproxy:
+    external: true
+    name: revproxy
