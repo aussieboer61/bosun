@@ -245,6 +245,6 @@ This means:
 
 ## License
 
-Copyright © 2026 SAE Engineering Pty Ltd. All rights reserved.
+Copyright © 2026 Sauer Pty Ltd. All rights reserved.
 
 Use of this software is governed by the [End User Licence Agreement](LICENSE). See [sauer.com.au/eula](https://sauer.com.au/eula) for the full terms.
