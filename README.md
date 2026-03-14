@@ -2,6 +2,20 @@
 
 A self-hosted Docker management UI built for homelabbers. Bosun stores container configurations as XML files and generates `docker-compose.yml` files from them, so your setup survives image rebuilds and can be version-controlled or backed up independently of the containers themselves.
 
+![Dashboard](docs/screenshots/dashboard.png)
+
+<details>
+<summary>More screenshots</summary>
+
+![Marketplace](docs/screenshots/marketplace.png)
+![Images](docs/screenshots/images.png)
+![Settings](docs/screenshots/settings.png)
+![Events](docs/screenshots/events.png)
+![Volumes](docs/screenshots/volumes.png)
+![Networks](docs/screenshots/networks.png)
+
+</details>
+
 ---
 
 ## Features
