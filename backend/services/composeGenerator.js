@@ -15,12 +15,20 @@ export function generateCompose(config) {
     service.privileged = true;
   }
 
-  // Network
-  const networkName = config.network || 'bridge';
-  if (networkName !== 'host' && networkName !== 'none') {
-    service.networks = [networkName];
+  // Command override
+  if (config.command && config.command.trim()) {
+    service.command = config.command.trim();
+  }
+
+  // Networks — supports array (new) or single string (legacy)
+  const networks = Array.isArray(config.networks) && config.networks.length > 0
+    ? config.networks.filter(Boolean)
+    : [config.network || 'bridge'];
+
+  if (networks.length === 1 && (networks[0] === 'host' || networks[0] === 'none')) {
+    service.network_mode = networks[0];
   } else {
-    service.network_mode = networkName;
+    service.networks = networks;
   }
 
   // Environment variables
@@ -30,23 +38,29 @@ export function generateCompose(config) {
       .map(e => `${e.name}=${e.value}`);
   }
 
-  // Volumes
+  // Volumes — supports bind mounts and named volumes
+  const namedVolumes = [];
   if (config.volumes && config.volumes.length > 0) {
     service.volumes = config.volumes
-      .filter(v => v.hostPath && v.containerPath)
+      .filter(v => v.type === 'named' ? (v.volumeName && v.containerPath) : (v.hostPath && v.containerPath))
       .map(v => {
         const mode = v.mode && v.mode !== 'rw' ? `:${v.mode}` : '';
+        if (v.type === 'named') {
+          namedVolumes.push({ name: v.volumeName, external: v.external || false });
+          return `${v.volumeName}:${v.containerPath}${mode}`;
+        }
         return `${v.hostPath}:${v.containerPath}${mode}`;
       });
   }
 
-  // Ports
+  // Ports — supports optional host IP for IP-scoped bindings
   if (config.ports && config.ports.length > 0) {
     service.ports = config.ports
       .filter(p => p.hostPort && p.containerPort)
       .map(p => {
         const proto = p.protocol && p.protocol !== 'tcp' ? `/${p.protocol}` : '';
-        return `"${p.hostPort}:${p.containerPort}${proto}"`;
+        const prefix = p.hostIP ? `${p.hostIP}:` : '';
+        return `"${prefix}${p.hostPort}:${p.containerPort}${proto}"`;
       });
   }
 
@@ -60,6 +74,25 @@ export function generateCompose(config) {
     }
   }
 
+  // Sysctls
+  if (config.sysctls && config.sysctls.length > 0) {
+    const validSysctls = config.sysctls.filter(s => s.key);
+    if (validSysctls.length > 0) {
+      service.sysctls = {};
+      for (const s of validSysctls) {
+        service.sysctls[s.key] = s.value;
+      }
+    }
+  }
+
+  // depends_on
+  if (config.dependsOn && config.dependsOn.length > 0) {
+    const deps = config.dependsOn.filter(Boolean);
+    if (deps.length > 0) {
+      service.depends_on = deps;
+    }
+  }
+
   // Build compose object
   const composeObj = {
     services: {
@@ -67,13 +100,22 @@ export function generateCompose(config) {
     }
   };
 
-  // Add network definition (if not host/none)
-  if (networkName !== 'host' && networkName !== 'none') {
-    composeObj.networks = {
-      [networkName]: {
-        external: true
-      }
-    };
+  // Add network definitions (external: true for each non-special network)
+  const externalNetworks = networks.filter(n => n !== 'host' && n !== 'none');
+  if (externalNetworks.length > 0) {
+    composeObj.networks = {};
+    for (const n of externalNetworks) {
+      composeObj.networks[n] = { external: true };
+    }
+  }
+
+  // Add named volume definitions
+  // Non-external volumes get name: pinned to prevent Docker prepending the project directory name
+  if (namedVolumes.length > 0) {
+    composeObj.volumes = {};
+    for (const vol of namedVolumes) {
+      composeObj.volumes[vol.name] = vol.external ? { external: true } : { name: vol.name };
+    }
   }
 
   // Use yaml.dump with custom options for clean output

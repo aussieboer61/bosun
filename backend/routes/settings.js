@@ -2,6 +2,7 @@ import { Router } from 'express';
 import fs from 'fs';
 import { join } from 'path';
 import authMiddleware from '../middleware/authMiddleware.js';
+import { scheduleAutoUpdates } from '../services/autoUpdate.js';
 
 const router = Router();
 const DATA_DIR = process.env.BOSUN_DATA_DIR || '/home/bosun';
@@ -59,7 +60,23 @@ router.put('/', (req, res) => {
         ? req.body.defaultSchedule : current.defaultSchedule
     };
     writeSettings(updated);
+    // Reschedule auto-updates whenever settings change
+    const io = req.app.get('io');
+    scheduleAutoUpdates(io);
     res.json(updated);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/settings/updates/log — recent update log lines
+router.get('/updates/log', (req, res) => {
+  try {
+    const logFile = join(DATA_DIR, 'data', 'updates.log');
+    if (!fs.existsSync(logFile)) return res.json({ lines: [] });
+    const content = fs.readFileSync(logFile, 'utf8');
+    const lines = content.trim().split('\n').filter(Boolean).slice(-200).reverse();
+    res.json({ lines });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

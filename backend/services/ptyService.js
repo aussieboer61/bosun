@@ -9,7 +9,6 @@ export function createPtySession(containerId, socket) {
 
     // Try /bin/sh first, fall back to /bin/bash
     const shells = ['/bin/sh', '/bin/bash'];
-    let started = false;
 
     for (const shell of shells) {
       try {
@@ -22,28 +21,33 @@ export function createPtySession(containerId, socket) {
           Env: ['TERM=xterm-256color']
         });
 
-        execStream = await execInstance.start({
-          hijack: true,
-          stdin: true,
-          Tty: true
+        // Hijacked TTY exec streams MUST use the callback form — the awaited
+        // form resolves to an HTTP IncomingMessage, not the raw duplex socket.
+        await new Promise((resolve, reject) => {
+          execInstance.start({ hijack: true, stdin: true }, (err, stream) => {
+            if (err) return reject(err);
+
+            execStream = stream;
+
+            // Forward raw container output to the browser terminal
+            stream.on('data', (chunk) => {
+              socket.emit('output', chunk);
+            });
+
+            stream.on('error', (err) => {
+              socket.emit('output', `\r\n[Error: ${err.message}]\r\n`);
+            });
+
+            stream.on('end', () => {
+              socket.emit('output', '\r\n[Session ended]\r\n');
+              socket.emit('exit');
+            });
+
+            socket.emit('output', `Connected to ${containerId} (${shell})\r\n`);
+            resolve();
+          });
         });
 
-        // Forward container output to socket
-        execStream.on('data', (chunk) => {
-          socket.emit('output', chunk.toString('binary'));
-        });
-
-        execStream.on('error', (err) => {
-          socket.emit('output', `\r\n[Error: ${err.message}]\r\n`);
-        });
-
-        execStream.on('end', () => {
-          socket.emit('output', '\r\n[Session ended]\r\n');
-          socket.emit('exit');
-        });
-
-        started = true;
-        socket.emit('output', `Connected to ${containerId} (${shell})\r\n`);
         break;
       } catch (err) {
         if (shell === shells[shells.length - 1]) {
@@ -52,8 +56,6 @@ export function createPtySession(containerId, socket) {
         }
       }
     }
-
-    return started;
   }
 
   // Handle input from terminal
@@ -72,7 +74,7 @@ export function createPtySession(containerId, socket) {
     if (execInstance) {
       try {
         await execInstance.resize({ w: cols, h: rows });
-      } catch (err) {
+      } catch {
         // Resize errors are non-fatal
       }
     }
@@ -89,7 +91,6 @@ export function createPtySession(containerId, socket) {
     execInstance = null;
   });
 
-  // Start the exec session
   startExec().catch(err => {
     console.error('PTY session error:', err.message);
     socket.emit('output', `\r\n[Fatal error: ${err.message}]\r\n`);

@@ -1,8 +1,13 @@
 import React, { useEffect, useRef, useState } from 'react'
+import { useParams, useSearchParams } from 'react-router-dom'
 import { io } from 'socket.io-client'
 import '@xterm/xterm/css/xterm.css'
 
-export default function ConsoleModal({ container, onClose }) {
+export default function ConsolePage() {
+  const { containerId } = useParams()
+  const [searchParams] = useSearchParams()
+  const containerName = searchParams.get('name') || containerId
+
   const termRef = useRef()
   const xtermRef = useRef()
   const fitAddonRef = useRef()
@@ -16,10 +21,8 @@ export default function ConsoleModal({ container, onClose }) {
     let fitAddon = null
 
     async function init() {
-      // Dynamically import xterm (avoids SSR issues and ensures DOM is ready)
       const { Terminal } = await import('@xterm/xterm')
       const { FitAddon } = await import('@xterm/addon-fit')
-
 
       if (!termRef.current) return
 
@@ -61,8 +64,18 @@ export default function ConsoleModal({ container, onClose }) {
       xtermRef.current = term
       fitAddonRef.current = fitAddon
 
-      // Socket.io connection
-      const token = localStorage.getItem('bosun_token')
+      // Get short-lived socket token (works for both local and Authentik auth)
+      let token = null
+      try {
+        const res = await fetch('/api/auth/socket-token', {
+          headers: { 'Authorization': `Bearer ${localStorage.getItem('bosun_token')}` }
+        })
+        if (res.ok) {
+          const data = await res.json()
+          token = data.token
+        }
+      } catch {}
+
       socket = io('/console', {
         auth: { token },
         transports: ['websocket', 'polling']
@@ -71,12 +84,11 @@ export default function ConsoleModal({ container, onClose }) {
 
       socket.on('connect', () => {
         setConnected(true)
-        socket.emit('start', { containerId: container.id })
+        socket.emit('start', { containerId })
       })
 
       socket.on('output', (data) => {
         if (term) {
-          // Socket.io delivers Buffers as Uint8Array on the client side
           if (data instanceof ArrayBuffer) {
             term.write(new Uint8Array(data))
           } else if (ArrayBuffer.isView(data)) {
@@ -88,46 +100,31 @@ export default function ConsoleModal({ container, onClose }) {
       })
 
       socket.on('exit', () => {
-        if (term) {
-          term.writeln('\r\n\r\n[Session terminated]')
-        }
+        if (term) term.writeln('\r\n\r\n[Session terminated]')
         setConnected(false)
       })
 
-      socket.on('disconnect', () => {
-        setConnected(false)
-      })
+      socket.on('disconnect', () => setConnected(false))
 
       socket.on('connect_error', (err) => {
         setError(`Connection error: ${err.message}`)
         setConnected(false)
       })
 
-      // Send input to socket
       term.onData((data) => {
-        if (socket && socket.connected) {
-          socket.emit('input', data)
-        }
+        if (socket && socket.connected) socket.emit('input', data)
       })
 
-      // Handle terminal resize
       term.onResize(({ cols, rows }) => {
-        if (socket && socket.connected) {
-          socket.emit('resize', { cols, rows })
-        }
+        if (socket && socket.connected) socket.emit('resize', { cols, rows })
       })
     }
 
-    init().catch(err => {
-      setError(`Failed to initialize terminal: ${err.message}`)
-    })
+    init().catch(err => setError(`Failed to initialize terminal: ${err.message}`))
 
-    // Window resize handler
     function handleResize() {
       if (fitAddonRef.current) {
-        try {
-          fitAddonRef.current.fit()
-        } catch {}
+        try { fitAddonRef.current.fit() } catch {}
       }
     }
     window.addEventListener('resize', handleResize)
@@ -137,14 +134,14 @@ export default function ConsoleModal({ container, onClose }) {
       if (socket) socket.disconnect()
       if (term) term.dispose()
     }
-  }, [container.id])
+  }, [containerId])
 
   return (
-    <div className="fixed inset-0 z-50 bg-slate-950 flex flex-col">
+    <div className="fixed inset-0 bg-slate-950 flex flex-col">
       {/* Header */}
       <div className="flex items-center gap-4 px-6 py-3 bg-slate-900 border-b border-slate-800 flex-shrink-0">
         <div className="flex items-center gap-2">
-          <span className="text-slate-100 font-semibold">{container.name}</span>
+          <span className="text-slate-100 font-semibold">{containerName}</span>
           <span className="text-slate-500 text-xs">exec: /bin/sh</span>
           <span className={`w-2 h-2 rounded-full ${connected ? 'bg-green-400' : 'bg-red-500'}`} />
           <span className={`text-xs ${connected ? 'text-green-400' : 'text-red-400'}`}>
@@ -153,7 +150,7 @@ export default function ConsoleModal({ container, onClose }) {
         </div>
         <div className="ml-auto">
           <button
-            onClick={onClose}
+            onClick={() => window.close()}
             className="text-slate-400 hover:text-slate-100 transition-colors px-3 py-1.5 rounded-lg text-sm"
           >
             ✕ Close
@@ -161,7 +158,6 @@ export default function ConsoleModal({ container, onClose }) {
         </div>
       </div>
 
-      {/* Error state */}
       {error && (
         <div className="px-6 py-3 bg-red-950/50 border-b border-red-800 text-red-400 text-sm">
           {error}

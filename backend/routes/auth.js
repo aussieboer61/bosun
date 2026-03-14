@@ -134,4 +134,11 @@ router.get('/me', authMiddleware, (req, res) => {
   res.json({ username: req.user.username });
 });
 
+// GET /api/auth/socket-token — short-lived token for socket.io auth
+// Works for both local JWT users and Authentik forward-auth users
+router.get('/socket-token', authMiddleware, (req, res) => {
+  const token = jwt.sign({ username: req.user.username }, JWT_SECRET, { expiresIn: '1h' });
+  res.json({ token });
+});
+
 export default router;

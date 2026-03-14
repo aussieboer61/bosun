@@ -3,22 +3,25 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        - DOCKER_GID=${DOCKER_GID:-999}
+    image: bosun
     container_name: bosun
     restart: unless-stopped
     ports:
-      - "4080:4080"
-    networks:
-      - revproxy
+      - "${BOSUN_PORT:-4080}:4080"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - /home/sauer/bosun:/home/bosun
+      - ${BOSUN_DATA_DIR:-./data}:/home/bosun
     environment:
-      - TZ=Australia/Brisbane
+      - TZ=${TZ:-UTC}
       - BOSUN_DATA_DIR=/home/bosun
       - NODE_ENV=production
-      - JWT_SECRET=bosun_jwt_secret_change_me_in_prod
+      - JWT_SECRET=${JWT_SECRET:-change_this_to_a_random_secret}
 
-networks:
-  revproxy:
-    external: true
-    name: revproxy
+    # Optional: attach to an existing reverse proxy network
+    # networks:
+    #   - proxy
+    # networks:
+    #   proxy:
+    #     external: true

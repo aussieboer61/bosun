@@ -10,10 +10,10 @@ const STATE_COLORS = {
   dead: 'bg-red-900/20 text-red-600 border-red-900/30',
 }
 
-function formatUptime(status) {
-  if (!status) return ''
-  // Docker status string like "Up 2 hours" or "Exited (0) 3 days ago"
-  return status
+const HEALTH_COLORS = {
+  healthy: 'bg-green-500/20 text-green-400 border-green-500/30',
+  unhealthy: 'bg-red-500/20 text-red-400 border-red-500/30',
+  starting: 'bg-yellow-500/20 text-yellow-400 border-yellow-500/30',
 }
 
 function IconPlaceholder({ name }) {
@@ -66,9 +66,7 @@ function Dropdown({ onClose, container, onAction }) {
           if (window.confirm(`Import config from running container "${container.name}"?`)) {
             fetch(`/api/containers/import/${container.id}`, {
               method: 'POST',
-              headers: {
-                'Authorization': `Bearer ${localStorage.getItem('bosun_token')}`
-              }
+              headers: { 'Authorization': `Bearer ${localStorage.getItem('bosun_token')}` }
             }).then(r => r.json()).then(config => {
               onAction('edit', { ...container, config, __imported: true })
             }).catch(err => alert('Import failed: ' + err.message))
@@ -101,9 +99,10 @@ function IconButton({ title, onClick, children, className = '' }) {
   )
 }
 
-export default function ContainerCard({ container, onAction }) {
+export default function ContainerCard({ container, onAction, selected, onSelect, selectable }) {
   const [dropdownOpen, setDropdownOpen] = useState(false)
   const [iconError, setIconError] = useState(false)
+  const [stats, setStats] = useState(null)
 
   const name = container.name || 'unknown'
   const state = container.state || 'unknown'
@@ -111,14 +110,57 @@ export default function ContainerCard({ container, onAction }) {
   const isRunning = state === 'running'
   const statusClass = STATE_COLORS[state] || 'bg-slate-500/20 text-slate-400 border-slate-500/30'
   const hasUpdate = container.updateInfo?.hasUpdate
+  const health = container.health
+
+  // Poll stats when running
+  useEffect(() => {
+    if (!isRunning) { setStats(null); return }
+    let cancelled = false
+    async function fetchStats() {
+      try {
+        const res = await fetch(`/api/containers/${container.id}/stats`, {
+          headers: { 'Authorization': `Bearer ${localStorage.getItem('bosun_token')}` }
+        })
+        if (res.ok && !cancelled) setStats(await res.json())
+      } catch {}
+    }
+    fetchStats()
+    const interval = setInterval(fetchStats, 5000)
+    return () => { cancelled = true; clearInterval(interval) }
+  }, [container.id, isRunning])
+
+  function handleCardClick(e) {
+    if (selectable) {
+      e.stopPropagation()
+      onSelect(container.id)
+      return
+    }
+    onAction('edit', container)
+  }
 
   return (
     <div
-      className="bg-slate-800 rounded-xl p-4 hover:bg-slate-800/80 transition-colors duration-150 cursor-pointer relative select-none"
-      onClick={() => onAction('edit', container)}
+      className={`bg-slate-800 rounded-xl p-4 hover:bg-slate-800/80 transition-colors duration-150 cursor-pointer relative select-none ${
+        selected ? 'ring-2 ring-blue-500' : ''
+      }`}
+      onClick={handleCardClick}
     >
+      {/* Bulk select checkbox */}
+      {selectable && (
+        <div
+          className="absolute top-3 left-3 z-10"
+          onClick={e => { e.stopPropagation(); onSelect(container.id) }}
+        >
+          <div className={`w-5 h-5 rounded border-2 flex items-center justify-center transition-colors ${
+            selected ? 'bg-blue-500 border-blue-500' : 'border-slate-600 bg-slate-700'
+          }`}>
+            {selected && <span className="text-white text-xs">✓</span>}
+          </div>
+        </div>
+      )}
+
       {/* Top row: icon + name + menu */}
-      <div className="flex items-start gap-3 mb-2.5">
+      <div className={`flex items-start gap-3 mb-2.5 ${selectable ? 'pl-6' : ''}`}>
         <div className="flex-shrink-0 mt-0.5">
           {config?.icon && !iconError ? (
             <img
@@ -139,33 +181,39 @@ export default function ContainerCard({ container, onAction }) {
           </p>
         </div>
 
-        <div className="relative flex-shrink-0">
-          <button
-            onClick={e => { e.stopPropagation(); setDropdownOpen(o => !o) }}
-            className="w-7 h-7 flex items-center justify-center rounded-lg text-slate-500 hover:text-slate-300 hover:bg-slate-700 transition-colors text-base"
-          >
-            ⋮
-          </button>
-          {dropdownOpen && (
-            <Dropdown
-              container={container}
-              onAction={onAction}
-              onClose={() => setDropdownOpen(false)}
-            />
-          )}
-        </div>
+        {!selectable && (
+          <div className="relative flex-shrink-0">
+            <button
+              onClick={e => { e.stopPropagation(); setDropdownOpen(o => !o) }}
+              className="w-7 h-7 flex items-center justify-center rounded-lg text-slate-500 hover:text-slate-300 hover:bg-slate-700 transition-colors text-base"
+            >
+              ⋮
+            </button>
+            {dropdownOpen && (
+              <Dropdown
+                container={container}
+                onAction={onAction}
+                onClose={() => setDropdownOpen(false)}
+              />
+            )}
+          </div>
+        )}
       </div>
 
       {/* Status badges */}
-      <div className="flex flex-wrap gap-1.5 mb-3">
+      <div className="flex flex-wrap gap-1.5 mb-2">
         <span className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-xs border font-medium ${statusClass}`}>
           <span className={`w-1.5 h-1.5 rounded-full ${
             isRunning ? 'bg-green-400' :
-            state === 'restarting' ? 'bg-yellow-400' :
-            'bg-red-400'
+            state === 'restarting' ? 'bg-yellow-400' : 'bg-red-400'
           }`} />
           {state}
         </span>
+        {health && (
+          <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs border font-medium ${HEALTH_COLORS[health] || ''}`}>
+            {health === 'healthy' ? '♥' : health === 'unhealthy' ? '✕' : '…'} {health}
+          </span>
+        )}
         {hasUpdate && (
           <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs border bg-blue-500/20 text-blue-400 border-blue-500/30 font-medium">
             ↑ update
@@ -175,14 +223,24 @@ export default function ContainerCard({ container, onAction }) {
 
       {/* Uptime */}
       {container.status && (
-        <p className="text-slate-500 text-xs mb-3 leading-tight">
-          {formatUptime(container.status)}
-        </p>
+        <p className="text-slate-500 text-xs mb-2 leading-tight">{container.status}</p>
+      )}
+
+      {/* Mini stats bar */}
+      {stats && (
+        <div className="flex items-center gap-3 mb-2 text-xs text-slate-500">
+          <span title="CPU">
+            <span className="text-slate-400">{stats.cpuPercent.toFixed(1)}%</span> CPU
+          </span>
+          <span title="Memory">
+            <span className="text-slate-400">{Math.round(stats.memUsed / 1024 / 1024)} MB</span> MEM
+            <span className="text-slate-600 ml-1">({stats.memPercent}%)</span>
+          </span>
+        </div>
       )}
 
       {/* Action buttons */}
       <div className="flex items-center gap-1.5" onClick={e => e.stopPropagation()}>
-        {/* Start/Stop toggle */}
         {isRunning ? (
           <IconButton
             title="Stop"
@@ -209,7 +267,6 @@ export default function ContainerCard({ container, onAction }) {
           ↺
         </IconButton>
 
-        {/* Update button - show if config exists */}
         {config && (
           <IconButton
             title={hasUpdate ? 'Update available — click to deploy' : 'Deploy / Update'}
@@ -222,7 +279,7 @@ export default function ContainerCard({ container, onAction }) {
 
         <IconButton
           title="View Logs"
-          onClick={() => onAction('logs', container)}
+          onClick={() => window.open(`/logs/${container.id}?name=${encodeURIComponent(name)}`, '_blank')}
           className="bg-slate-700 hover:bg-slate-600 text-slate-300 hover:text-white"
         >
           ≡
@@ -230,13 +287,12 @@ export default function ContainerCard({ container, onAction }) {
 
         <IconButton
           title="Open Console"
-          onClick={() => onAction('console', container)}
+          onClick={() => window.open(`/console/${container.id}?name=${encodeURIComponent(name)}`, '_blank')}
           className="bg-slate-700 hover:bg-slate-600 text-slate-300 hover:text-white"
         >
           ⌨
         </IconButton>
 
-        {/* WebUI link */}
         {config?.webUI && (
           <a
             href={config.webUI}

@@ -9,7 +9,12 @@ import jwt from 'jsonwebtoken';
 import authRoutes from './routes/auth.js';
 import containerRoutes from './routes/containers.js';
 import settingsRoutes from './routes/settings.js';
-import { followLogs } from './services/dockerService.js';
+import imageRoutes from './routes/images.js';
+import volumeRoutes from './routes/volumes.js';
+import networkRoutes from './routes/networks.js';
+import marketplaceRoutes from './routes/marketplace.js';
+import backupRoutes from './routes/backup.js';
+import { followLogs, streamEvents } from './services/dockerService.js';
 import { createPtySession } from './services/ptyService.js';
 import { runAutoStart, scheduleAutoUpdates } from './services/autoUpdate.js';
 
@@ -103,6 +108,16 @@ pullNs.on('connection', (socket) => {
   // No special setup needed — events are broadcast to the namespace
 });
 
+// /events namespace — Docker daemon event stream
+const eventsNs = io.of('/events');
+eventsNs.use(verifySocketToken);
+eventsNs.on('connection', (socket) => {
+  const cleanup = streamEvents((event) => {
+    socket.emit('event', event);
+  });
+  socket.on('disconnect', cleanup);
+});
+
 // Express middleware
 app.use(express.json());
 
@@ -110,6 +125,11 @@ app.use(express.json());
 app.use('/api/auth', authRoutes);
 app.use('/api/containers', containerRoutes);
 app.use('/api/settings', settingsRoutes);
+app.use('/api/images', imageRoutes);
+app.use('/api/volumes', volumeRoutes);
+app.use('/api/networks', networkRoutes);
+app.use('/api/marketplace', marketplaceRoutes);
+app.use('/api/backup', backupRoutes);
 
 // Serve built React frontend
 const frontendDist = join(__dirname, 'frontend', 'dist');

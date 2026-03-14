@@ -65,13 +65,16 @@ export default function ContainerEditor({ container, onClose, onSave }) {
     autoStart: false,
     autoUpdate: false,
     autoUpdateSchedule: '0 3 * * *',
-    network: 'bridge',
+    networks: ['bridge'],
+    command: '',
     privileged: false,
     restartPolicy: 'unless-stopped',
     environment: [],
     volumes: [],
     ports: [],
-    labels: []
+    labels: [],
+    sysctls: [],
+    dependsOn: []
   })
 
   const [loading, setLoading] = useState(false)
@@ -89,20 +92,17 @@ export default function ContainerEditor({ container, onClose, onSave }) {
   async function loadConfig() {
     setLoading(true)
     try {
-      // If container has an imported config object, use it directly
       if (container.__imported && container.config) {
-        setConfig(container.config)
+        setConfig(normalizeLoaded(container.config))
         return
       }
-      // Try to load existing XML config
       if (container.config) {
-        setConfig(container.config)
+        setConfig(normalizeLoaded(container.config))
       } else if (container.name) {
         try {
           const cfg = await get(`/api/containers/configs/${container.name}`)
-          setConfig(cfg)
+          setConfig(normalizeLoaded(cfg))
         } catch {
-          // No config yet — prefill from container data
           if (container.image) {
             setConfig(c => ({ ...c, name: container.name, repository: container.image }))
           }
@@ -112,6 +112,25 @@ export default function ContainerEditor({ container, onClose, onSave }) {
       setError(err.message)
     } finally {
       setLoading(false)
+    }
+  }
+
+  // Ensure new fields have defaults when loading older configs
+  function normalizeLoaded(cfg) {
+    return {
+      sysctls: [],
+      dependsOn: [],
+      ...cfg,
+      volumes: (cfg.volumes || []).map(v => ({
+        type: 'bind',
+        volumeName: '',
+        external: false,
+        ...v
+      })),
+      ports: (cfg.ports || []).map(p => ({
+        hostIP: '',
+        ...p
+      }))
     }
   }
 
@@ -136,7 +155,7 @@ export default function ContainerEditor({ container, onClose, onSave }) {
 
   // Volumes
   function addVolume() {
-    setConfig(c => ({ ...c, volumes: [...c.volumes, { hostPath: '', containerPath: '', mode: 'rw', description: '' }] }))
+    setConfig(c => ({ ...c, volumes: [...c.volumes, { type: 'bind', hostPath: '', containerPath: '', mode: 'rw', description: '', volumeName: '', external: false }] }))
   }
   function updateVolume(i, key, value) {
     setConfig(c => {
@@ -151,7 +170,7 @@ export default function ContainerEditor({ container, onClose, onSave }) {
 
   // Ports
   function addPort() {
-    setConfig(c => ({ ...c, ports: [...c.ports, { hostPort: '', containerPort: '', protocol: 'tcp', description: '' }] }))
+    setConfig(c => ({ ...c, ports: [...c.ports, { hostPort: '', containerPort: '', hostIP: '', protocol: 'tcp', description: '' }] }))
   }
   function updatePort(i, key, value) {
     setConfig(c => {
@@ -179,10 +198,85 @@ export default function ContainerEditor({ container, onClose, onSave }) {
     setConfig(c => ({ ...c, labels: c.labels.filter((_, idx) => idx !== i) }))
   }
 
+  // Networks
+  function addNetwork() {
+    setConfig(c => ({ ...c, networks: [...(c.networks || []), ''] }))
+  }
+  function updateNetwork(i, value) {
+    setConfig(c => {
+      const nets = [...(c.networks || [])]
+      nets[i] = value
+      return { ...c, networks: nets }
+    })
+  }
+  function removeNetwork(i) {
+    setConfig(c => ({ ...c, networks: (c.networks || []).filter((_, idx) => idx !== i) }))
+  }
+
+  // Sysctls
+  function addSysctl() {
+    setConfig(c => ({ ...c, sysctls: [...(c.sysctls || []), { key: '', value: '' }] }))
+  }
+  function updateSysctl(i, key, value) {
+    setConfig(c => {
+      const sysctls = [...(c.sysctls || [])]
+      sysctls[i] = { ...sysctls[i], [key]: value }
+      return { ...c, sysctls }
+    })
+  }
+  function removeSysctl(i) {
+    setConfig(c => ({ ...c, sysctls: (c.sysctls || []).filter((_, idx) => idx !== i) }))
+  }
+
+  // DependsOn
+  function addDependsOn() {
+    setConfig(c => ({ ...c, dependsOn: [...(c.dependsOn || []), ''] }))
+  }
+  function updateDependsOn(i, value) {
+    setConfig(c => {
+      const deps = [...(c.dependsOn || [])]
+      deps[i] = value
+      return { ...c, dependsOn: deps }
+    })
+  }
+  function removeDependsOn(i) {
+    setConfig(c => ({ ...c, dependsOn: (c.dependsOn || []).filter((_, idx) => idx !== i) }))
+  }
+
   async function handleSave(andDeploy = false) {
     setError('')
     if (!config.name) { setError('Container name is required'); return }
     if (!config.repository) { setError('Image repository is required'); return }
+
+    // Port conflict check — compare config ports against running containers
+    const configHostPorts = (config.ports || [])
+      .filter(p => p.hostPort)
+      .map(p => String(p.hostPort))
+
+    if (configHostPorts.length > 0) {
+      try {
+        const { containers } = await get('/api/containers')
+        const conflicts = []
+        for (const c of containers) {
+          if (c.name === config.name) continue // skip self (editing existing)
+          for (const p of (c.ports || [])) {
+            const pub = String(p.PublicPort || '')
+            if (pub && configHostPorts.includes(pub)) {
+              conflicts.push({ port: pub, container: c.name })
+            }
+          }
+        }
+        if (conflicts.length > 0) {
+          const lines = conflicts.map(c => `  • Port ${c.port} is used by "${c.container}"`).join('\n')
+          const ok = window.confirm(
+            `Port conflict detected:\n\n${lines}\n\nDeploy anyway?`
+          )
+          if (!ok) return
+        }
+      } catch {
+        // non-fatal — proceed if check fails
+      }
+    }
 
     setSaving(true)
     try {
@@ -195,12 +289,15 @@ export default function ContainerEditor({ container, onClose, onSave }) {
     }
   }
 
+  const advancedCount = (config.sysctls || []).length + (config.dependsOn || []).length
+
   const tabs = [
     { id: 'general', label: 'General' },
     { id: 'env', label: `Env (${config.environment.length})` },
     { id: 'volumes', label: `Volumes (${config.volumes.length})` },
     { id: 'ports', label: `Ports (${config.ports.length})` },
     { id: 'labels', label: `Labels (${config.labels.length})` },
+    { id: 'advanced', label: advancedCount > 0 ? `Advanced (${advancedCount})` : 'Advanced' },
     { id: 'behaviour', label: 'Behaviour' },
   ]
 
@@ -270,27 +367,54 @@ export default function ContainerEditor({ container, onClose, onSave }) {
                     </div>
                   </div>
 
-                  <div className="grid grid-cols-2 gap-4">
-                    <div>
-                      <label className="block text-sm font-medium text-slate-300 mb-1.5">Registry URL</label>
-                      <input
-                        type="text"
-                        value={config.registry}
-                        onChange={e => updateConfig('registry', e.target.value)}
-                        className="input-field"
-                        placeholder="https://registry-1.docker.io"
-                      />
+                  <div>
+                    <label className="block text-sm font-medium text-slate-300 mb-1.5">Registry URL</label>
+                    <input
+                      type="text"
+                      value={config.registry}
+                      onChange={e => updateConfig('registry', e.target.value)}
+                      className="input-field"
+                      placeholder="https://registry-1.docker.io"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-sm font-medium text-slate-300 mb-1.5">Networks</label>
+                    <div className="space-y-2">
+                      {(config.networks || []).map((net, i) => (
+                        <div key={i} className="flex gap-2 items-center">
+                          <input
+                            type="text"
+                            value={net}
+                            onChange={e => updateNetwork(i, e.target.value)}
+                            className="input-field flex-1"
+                            placeholder="bridge"
+                          />
+                          <button
+                            type="button"
+                            onClick={() => removeNetwork(i)}
+                            disabled={(config.networks || []).length <= 1}
+                            className="text-red-500 hover:text-red-400 transition-colors p-1 disabled:opacity-30 disabled:cursor-not-allowed"
+                            title="Remove network"
+                          >✕</button>
+                        </div>
+                      ))}
                     </div>
-                    <div>
-                      <label className="block text-sm font-medium text-slate-300 mb-1.5">Network</label>
-                      <input
-                        type="text"
-                        value={config.network}
-                        onChange={e => updateConfig('network', e.target.value)}
-                        className="input-field"
-                        placeholder="bridge"
-                      />
-                    </div>
+                    <button type="button" onClick={addNetwork} className="mt-2 btn-secondary text-sm">
+                      + Add Network
+                    </button>
+                  </div>
+
+                  <div>
+                    <label className="block text-sm font-medium text-slate-300 mb-1.5">Command Override</label>
+                    <input
+                      type="text"
+                      value={config.command || ''}
+                      onChange={e => updateConfig('command', e.target.value)}
+                      className="input-field font-mono text-xs"
+                      placeholder="leave empty to use image default"
+                    />
+                    <p className="text-slate-600 text-xs mt-1">e.g. <code>--base-url /app</code> or <code>server</code></p>
                   </div>
 
                   <div>
@@ -392,43 +516,97 @@ export default function ContainerEditor({ container, onClose, onSave }) {
               {/* Volumes Tab */}
               {activeTab === 'volumes' && (
                 <div>
-                  <div className="overflow-x-auto">
-                    <table className="w-full text-sm">
-                      <thead>
-                        <tr className="border-b border-slate-700">
-                          <th className="text-left px-2 py-2 text-slate-400 font-medium">Host Path</th>
-                          <th className="text-left px-2 py-2 text-slate-400 font-medium">Container Path</th>
-                          <th className="text-left px-2 py-2 text-slate-400 font-medium w-20">Mode</th>
-                          <th className="text-left px-2 py-2 text-slate-400 font-medium">Description</th>
-                          <th className="w-8" />
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {config.volumes.map((vol, i) => (
-                          <TableRow key={i} onDelete={() => removeVolume(i)}>
-                            <td className="px-2 py-2">
-                              <TableInput value={vol.hostPath} onChange={v => updateVolume(i, 'hostPath', v)} placeholder="/host/path" />
-                            </td>
-                            <td className="px-2 py-2">
-                              <TableInput value={vol.containerPath} onChange={v => updateVolume(i, 'containerPath', v)} placeholder="/container/path" />
-                            </td>
-                            <td className="px-2 py-2">
-                              <select
-                                value={vol.mode}
-                                onChange={e => updateVolume(i, 'mode', e.target.value)}
-                                className="bg-slate-700 border border-slate-600 rounded px-2 py-1.5 text-slate-100 text-sm focus:outline-none focus:ring-1 focus:ring-blue-500 w-full"
-                              >
-                                <option value="rw">rw</option>
-                                <option value="ro">ro</option>
-                              </select>
-                            </td>
-                            <td className="px-2 py-2">
-                              <TableInput value={vol.description} onChange={v => updateVolume(i, 'description', v)} placeholder="optional" />
-                            </td>
-                          </TableRow>
-                        ))}
-                      </tbody>
-                    </table>
+                  <div className="space-y-3">
+                    {config.volumes.map((vol, i) => (
+                      <div key={i} className="bg-slate-800 rounded-lg p-3 space-y-2">
+                        <div className="flex items-center justify-between">
+                          <div className="flex gap-2">
+                            <button
+                              type="button"
+                              onClick={() => updateVolume(i, 'type', 'bind')}
+                              className={`px-2.5 py-1 rounded text-xs font-medium transition-colors ${vol.type !== 'named' ? 'bg-blue-600 text-white' : 'bg-slate-700 text-slate-400 hover:text-slate-300'}`}
+                            >
+                              Bind Mount
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => updateVolume(i, 'type', 'named')}
+                              className={`px-2.5 py-1 rounded text-xs font-medium transition-colors ${vol.type === 'named' ? 'bg-blue-600 text-white' : 'bg-slate-700 text-slate-400 hover:text-slate-300'}`}
+                            >
+                              Named Volume
+                            </button>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => removeVolume(i)}
+                            className="text-red-500 hover:text-red-400 transition-colors p-1"
+                            title="Remove"
+                          >✕</button>
+                        </div>
+
+                        <div className="grid grid-cols-2 gap-2">
+                          {vol.type === 'named' ? (
+                            <div>
+                              <label className="block text-xs text-slate-500 mb-1">Volume Name</label>
+                              <TableInput
+                                value={vol.volumeName || ''}
+                                onChange={v => updateVolume(i, 'volumeName', v)}
+                                placeholder="my_volume"
+                              />
+                            </div>
+                          ) : (
+                            <div>
+                              <label className="block text-xs text-slate-500 mb-1">Host Path</label>
+                              <TableInput
+                                value={vol.hostPath}
+                                onChange={v => updateVolume(i, 'hostPath', v)}
+                                placeholder="/host/path"
+                              />
+                            </div>
+                          )}
+                          <div>
+                            <label className="block text-xs text-slate-500 mb-1">Container Path</label>
+                            <TableInput
+                              value={vol.containerPath}
+                              onChange={v => updateVolume(i, 'containerPath', v)}
+                              placeholder="/container/path"
+                            />
+                          </div>
+                        </div>
+
+                        <div className="flex gap-4 items-center">
+                          <div className="flex items-center gap-2">
+                            <label className="text-xs text-slate-500">Mode</label>
+                            <select
+                              value={vol.mode}
+                              onChange={e => updateVolume(i, 'mode', e.target.value)}
+                              className="bg-slate-700 border border-slate-600 rounded px-2 py-1 text-slate-100 text-xs focus:outline-none focus:ring-1 focus:ring-blue-500"
+                            >
+                              <option value="rw">rw</option>
+                              <option value="ro">ro</option>
+                            </select>
+                          </div>
+                          {vol.type === 'named' && (
+                            <label className="flex items-center gap-2 cursor-pointer">
+                              <input
+                                type="checkbox"
+                                checked={vol.external || false}
+                                onChange={e => updateVolume(i, 'external', e.target.checked)}
+                                className="w-3.5 h-3.5 rounded border-slate-600 bg-slate-700 text-blue-600 focus:ring-blue-500"
+                              />
+                              <span className="text-xs text-slate-400">External (pre-existing volume)</span>
+                            </label>
+                          )}
+                          <div className="flex-1">
+                            <TableInput
+                              value={vol.description}
+                              onChange={v => updateVolume(i, 'description', v)}
+                              placeholder="description (optional)"
+                            />
+                          </div>
+                        </div>
+                      </div>
+                    ))}
                   </div>
                   <button type="button" onClick={addVolume} className="mt-3 btn-secondary text-sm">
                     + Add Volume
@@ -443,6 +621,7 @@ export default function ContainerEditor({ container, onClose, onSave }) {
                     <table className="w-full text-sm">
                       <thead>
                         <tr className="border-b border-slate-700">
+                          <th className="text-left px-2 py-2 text-slate-400 font-medium">Host IP</th>
                           <th className="text-left px-2 py-2 text-slate-400 font-medium">Host Port</th>
                           <th className="text-left px-2 py-2 text-slate-400 font-medium">Container Port</th>
                           <th className="text-left px-2 py-2 text-slate-400 font-medium w-24">Protocol</th>
@@ -453,6 +632,9 @@ export default function ContainerEditor({ container, onClose, onSave }) {
                       <tbody>
                         {config.ports.map((port, i) => (
                           <TableRow key={i} onDelete={() => removePort(i)}>
+                            <td className="px-2 py-2">
+                              <TableInput value={port.hostIP || ''} onChange={v => updatePort(i, 'hostIP', v)} placeholder="any" />
+                            </td>
                             <td className="px-2 py-2">
                               <TableInput value={port.hostPort} onChange={v => updatePort(i, 'hostPort', v)} placeholder="8080" type="text" />
                             </td>
@@ -477,6 +659,7 @@ export default function ContainerEditor({ container, onClose, onSave }) {
                       </tbody>
                     </table>
                   </div>
+                  <p className="text-slate-600 text-xs mt-2">Host IP: leave blank to bind all interfaces, or enter e.g. <code>192.168.0.3</code> to restrict to one interface.</p>
                   <button type="button" onClick={addPort} className="mt-3 btn-secondary text-sm">
                     + Add Port
                   </button>
@@ -512,6 +695,69 @@ export default function ContainerEditor({ container, onClose, onSave }) {
                   <button type="button" onClick={addLabel} className="mt-3 btn-secondary text-sm">
                     + Add Label
                   </button>
+                </div>
+              )}
+
+              {/* Advanced Tab — sysctls + depends_on */}
+              {activeTab === 'advanced' && (
+                <div className="space-y-8">
+                  <div>
+                    <SectionHeader title="Sysctls" />
+                    <p className="text-slate-500 text-xs mb-3">Kernel parameter overrides. e.g. <code>net.ipv6.conf.all.disable_ipv6 = 1</code></p>
+                    <div className="overflow-x-auto">
+                      <table className="w-full text-sm">
+                        <thead>
+                          <tr className="border-b border-slate-700">
+                            <th className="text-left px-2 py-2 text-slate-400 font-medium">Key</th>
+                            <th className="text-left px-2 py-2 text-slate-400 font-medium">Value</th>
+                            <th className="w-8" />
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {(config.sysctls || []).map((s, i) => (
+                            <TableRow key={i} onDelete={() => removeSysctl(i)}>
+                              <td className="px-2 py-2">
+                                <TableInput value={s.key} onChange={v => updateSysctl(i, 'key', v)} placeholder="net.ipv4.ip_forward" className="font-mono text-xs" />
+                              </td>
+                              <td className="px-2 py-2">
+                                <TableInput value={s.value} onChange={v => updateSysctl(i, 'value', v)} placeholder="1" />
+                              </td>
+                            </TableRow>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                    <button type="button" onClick={addSysctl} className="mt-3 btn-secondary text-sm">
+                      + Add Sysctl
+                    </button>
+                  </div>
+
+                  <div>
+                    <SectionHeader title="Depends On" />
+                    <p className="text-slate-500 text-xs mb-3">Container names that must be running before this service starts.</p>
+                    <div className="space-y-2">
+                      {(config.dependsOn || []).map((dep, i) => (
+                        <div key={i} className="flex gap-2 items-center">
+                          <input
+                            type="text"
+                            value={dep}
+                            onChange={e => updateDependsOn(i, e.target.value)}
+                            className="input-field flex-1"
+                            placeholder="postgresql"
+                          />
+                          <button
+                            type="button"
+                            onClick={() => removeDependsOn(i)}
+                            className="text-red-500 hover:text-red-400 transition-colors p-1"
+                            title="Remove"
+                          >✕</button>
+                        </div>
+                      ))}
+                    </div>
+                    <button type="button" onClick={addDependsOn} className="mt-2 btn-secondary text-sm">
+                      + Add Dependency
+                    </button>
+                  </div>
                 </div>
               )}
 

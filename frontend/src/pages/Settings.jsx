@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react'
+import React, { useState, useEffect, useRef } from 'react'
 import Nav from '../components/Nav.jsx'
 import { useAuth } from '../hooks/useAuth.jsx'
 import { get, put, post, del } from '../lib/api.js'
@@ -12,6 +12,211 @@ function Section({ title, description, children }) {
       </div>
       {children}
     </div>
+  )
+}
+
+function BackupSection() {
+  const [restoring, setRestoring] = useState(false)
+  const [restoreMsg, setRestoreMsg] = useState('')
+  const fileRef = React.useRef()
+
+  function downloadBackup() {
+    const a = document.createElement('a')
+    a.href = '/api/backup'
+    const headers = { 'Authorization': `Bearer ${localStorage.getItem('bosun_token')}` }
+    fetch('/api/backup', { headers })
+      .then(r => r.blob())
+      .then(blob => {
+        const url = URL.createObjectURL(blob)
+        a.href = url
+        a.download = `bosun-backup-${new Date().toISOString().slice(0, 10)}.json`
+        a.click()
+        URL.revokeObjectURL(url)
+      })
+      .catch(err => alert('Export failed: ' + err.message))
+  }
+
+  function handleRestore(e) {
+    const file = e.target.files?.[0]
+    if (!file) return
+    const reader = new FileReader()
+    reader.onload = async (ev) => {
+      try {
+        const payload = JSON.parse(ev.target.result)
+        if (!payload.configs) throw new Error('Invalid backup file')
+        const overwrite = window.confirm(
+          `Restore ${payload.configs.length} configs?\n\nClick OK to overwrite existing, Cancel to skip existing.`
+        )
+        setRestoring(true)
+        const res = await fetch('/api/backup/restore', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${localStorage.getItem('bosun_token')}`
+          },
+          body: JSON.stringify({ configs: payload.configs, overwrite })
+        })
+        const result = await res.json()
+        setRestoreMsg(`Imported ${result.imported?.length || 0}, skipped ${result.skipped?.length || 0}, errors ${result.errors?.length || 0}`)
+        setTimeout(() => setRestoreMsg(''), 6000)
+      } catch (err) {
+        setRestoreMsg('Restore failed: ' + err.message)
+        setTimeout(() => setRestoreMsg(''), 6000)
+      } finally {
+        setRestoring(false)
+        if (fileRef.current) fileRef.current.value = ''
+      }
+    }
+    reader.readAsText(file)
+  }
+
+  return (
+    <Section title="Backup & Restore" description="Export all container configs to a JSON file, or restore from a previous backup.">
+      <div className="flex items-center gap-3 flex-wrap">
+        <button onClick={downloadBackup} className="btn-secondary">
+          ↓ Export Configs
+        </button>
+        <button onClick={() => fileRef.current?.click()} disabled={restoring} className="btn-secondary disabled:opacity-50">
+          {restoring ? 'Restoring…' : '↑ Import Backup'}
+        </button>
+        <input ref={fileRef} type="file" accept=".json" className="hidden" onChange={handleRestore} />
+        {restoreMsg && <span className="text-sm text-slate-400">{restoreMsg}</span>}
+      </div>
+    </Section>
+  )
+}
+
+function AutoUpdateSection({ settings, saveSettings, setSettings }) {
+  const [checkingUpdates, setCheckingUpdates] = useState(false)
+  const [runningUpdates, setRunningUpdates] = useState(false)
+  const [updateMsg, setUpdateMsg] = useState('')
+  const [log, setLog] = useState([])
+  const [logLoading, setLogLoading] = useState(false)
+  const [showLog, setShowLog] = useState(false)
+
+  async function checkUpdates() {
+    setCheckingUpdates(true)
+    setUpdateMsg('')
+    try {
+      const res = await post('/api/containers/check-updates', {})
+      setUpdateMsg(`Checking updates for ${res.count} containers — badges will update on next refresh`)
+      setTimeout(() => setUpdateMsg(''), 8000)
+    } catch (err) {
+      setUpdateMsg('Check failed: ' + err.message)
+    } finally {
+      setCheckingUpdates(false)
+    }
+  }
+
+  async function runUpdates() {
+    if (!window.confirm('Pull and redeploy all managed containers now?\n\nContainers will restart one at a time.')) return
+    setRunningUpdates(true)
+    setUpdateMsg('')
+    try {
+      await post('/api/containers/update-all', {})
+      setUpdateMsg('Updates started — check the log below for progress')
+      setTimeout(() => setUpdateMsg(''), 8000)
+    } catch (err) {
+      setUpdateMsg('Failed: ' + err.message)
+    } finally {
+      setRunningUpdates(false)
+    }
+  }
+
+  async function loadLog() {
+    setLogLoading(true)
+    try {
+      const data = await get('/api/settings/updates/log')
+      setLog(data.lines || [])
+    } catch {
+      setLog(['Failed to load log'])
+    } finally {
+      setLogLoading(false)
+    }
+  }
+
+  function toggleLog() {
+    if (!showLog) loadLog()
+    setShowLog(v => !v)
+  }
+
+  return (
+    <Section
+      title="Auto-Update"
+      description="Automatically pull and redeploy containers on a schedule. Replaces Watchtower."
+    >
+      <div className="space-y-4">
+        <label className="flex items-center gap-3 cursor-pointer">
+          <div
+            onClick={() => saveSettings({ autoUpdateEnabled: !settings.autoUpdateEnabled })}
+            className={`relative w-11 h-6 rounded-full transition-colors duration-200 ${
+              settings?.autoUpdateEnabled ? 'bg-blue-600' : 'bg-slate-700'
+            }`}
+          >
+            <div className={`absolute top-0.5 left-0.5 w-5 h-5 bg-white rounded-full shadow transition-transform duration-200 ${
+              settings?.autoUpdateEnabled ? 'translate-x-5' : 'translate-x-0'
+            }`} />
+          </div>
+          <span className="text-slate-300 text-sm">Enable auto-updates globally (all managed containers)</span>
+        </label>
+
+        <div>
+          <label className="block text-sm font-medium text-slate-300 mb-1.5">
+            Default Schedule (cron expression)
+          </label>
+          <input
+            type="text"
+            value={settings?.defaultSchedule || ''}
+            onChange={e => setSettings(s => ({ ...s, defaultSchedule: e.target.value }))}
+            onBlur={() => saveSettings({ defaultSchedule: settings.defaultSchedule })}
+            className="input-field max-w-xs"
+            placeholder="0 3 * * *"
+          />
+          <p className="text-slate-600 text-xs mt-1">Default: <code>0 3 * * *</code> (3 AM daily). Per-container schedule in container settings overrides this.</p>
+        </div>
+
+        <div className="flex items-center gap-3 pt-1 flex-wrap">
+          <button onClick={checkUpdates} disabled={checkingUpdates} className="btn-secondary disabled:opacity-50 text-sm">
+            {checkingUpdates ? 'Checking…' : 'Check for Updates'}
+          </button>
+          <button onClick={runUpdates} disabled={runningUpdates} className="btn-secondary disabled:opacity-50 text-sm">
+            {runningUpdates ? 'Starting…' : 'Run Updates Now'}
+          </button>
+          <button onClick={toggleLog} className="text-slate-500 hover:text-slate-300 text-sm transition-colors">
+            {showLog ? 'Hide Log ▲' : 'Show Log ▼'}
+          </button>
+          {updateMsg && <span className="text-sm text-slate-400">{updateMsg}</span>}
+        </div>
+
+        {showLog && (
+          <div className="mt-2">
+            <div className="flex items-center justify-between mb-1.5">
+              <span className="text-xs text-slate-500">Recent update activity (newest first)</span>
+              <button onClick={loadLog} disabled={logLoading} className="text-xs text-slate-600 hover:text-slate-400 transition-colors">
+                {logLoading ? 'Loading…' : '↻ Refresh'}
+              </button>
+            </div>
+            <div className="bg-slate-950 border border-slate-800 rounded-lg p-3 max-h-64 overflow-y-auto font-mono text-xs space-y-0.5">
+              {log.length === 0 ? (
+                <span className="text-slate-600">No update activity yet</span>
+              ) : log.map((line, i) => (
+                <div
+                  key={i}
+                  className={`${
+                    line.includes('ERROR') ? 'text-red-400' :
+                    line.includes('complete') || line.includes('Complete') ? 'text-green-400' :
+                    line.includes('pulled') || line.includes('Pulled') ? 'text-blue-400' :
+                    'text-slate-400'
+                  }`}
+                >
+                  {line}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
+    </Section>
   )
 }
 
@@ -241,41 +446,7 @@ export default function Settings() {
         </Section>
 
         {/* Auto-update */}
-        <Section
-          title="Auto-Update"
-          description="Automatically pull and redeploy containers on a schedule."
-        >
-          <div className="space-y-4">
-            <label className="flex items-center gap-3 cursor-pointer">
-              <div
-                onClick={() => saveSettings({ autoUpdateEnabled: !settings.autoUpdateEnabled })}
-                className={`relative w-11 h-6 rounded-full transition-colors duration-200 ${
-                  settings?.autoUpdateEnabled ? 'bg-blue-600' : 'bg-slate-700'
-                }`}
-              >
-                <div className={`absolute top-0.5 left-0.5 w-5 h-5 bg-white rounded-full shadow transition-transform duration-200 ${
-                  settings?.autoUpdateEnabled ? 'translate-x-5' : 'translate-x-0'
-                }`} />
-              </div>
-              <span className="text-slate-300 text-sm">Enable auto-updates globally</span>
-            </label>
-
-            <div>
-              <label className="block text-sm font-medium text-slate-300 mb-1.5">
-                Default Schedule (cron expression)
-              </label>
-              <input
-                type="text"
-                value={settings?.defaultSchedule || ''}
-                onChange={e => setSettings(s => ({ ...s, defaultSchedule: e.target.value }))}
-                onBlur={() => saveSettings({ defaultSchedule: settings.defaultSchedule })}
-                className="input-field max-w-xs"
-                placeholder="0 3 * * *"
-              />
-              <p className="text-slate-600 text-xs mt-1">Default: <code>0 3 * * *</code> (3 AM daily)</p>
-            </div>
-          </div>
-        </Section>
+        <AutoUpdateSection settings={settings} saveSettings={saveSettings} setSettings={setSettings} />
 
         {/* Change Password */}
         <Section
@@ -324,6 +495,9 @@ export default function Settings() {
             </button>
           </form>
         </Section>
+
+        {/* Backup & Restore */}
+        <BackupSection />
 
         {/* About */}
         <Section title="About">

@@ -2,8 +2,7 @@ import cron from 'node-cron';
 import fs from 'fs';
 import { join } from 'path';
 import { listConfigs } from './xmlService.js';
-import { listContainers, startContainer } from './dockerService.js';
-import { pullImage, stopContainer, removeContainer } from './dockerService.js';
+import { listContainers, startContainer, pullImage, stopContainer, removeContainer, pruneImages } from './dockerService.js';
 import { generateCompose, saveCompose } from './composeGenerator.js';
 import { exec } from 'child_process';
 import { promisify } from 'util';
@@ -14,8 +13,16 @@ const DATA_DIR = process.env.BOSUN_DATA_DIR || '/home/bosun';
 // Keep track of scheduled jobs so we don't double-schedule
 const scheduledJobs = new Map();
 
+function readSettings() {
+  const file = join(DATA_DIR, 'data', 'settings.json');
+  const defaults = { autoUpdateEnabled: false, defaultSchedule: '0 3 * * *' };
+  if (!fs.existsSync(file)) return defaults;
+  try { return { ...defaults, ...JSON.parse(fs.readFileSync(file, 'utf8')) }; }
+  catch { return defaults; }
+}
+
 function appendLog(message) {
-  const logFile = join(DATA_DIR, 'data', 'autostart.log');
+  const logFile = join(DATA_DIR, 'data', 'updates.log');
   const line = `[${new Date().toISOString()}] ${message}\n`;
   try {
     fs.mkdirSync(join(DATA_DIR, 'data'), { recursive: true });
@@ -26,7 +33,7 @@ function appendLog(message) {
 
 async function performUpdate(config, io) {
   const name = config.name;
-  appendLog(`AutoUpdate: starting update for ${name}`);
+  appendLog(`Update started: ${name}`);
 
   const pullNs = io ? io.of('/pull') : null;
   const emit = (data) => {
@@ -38,31 +45,20 @@ async function performUpdate(config, io) {
     const yaml = generateCompose(config);
     await saveCompose(name, yaml);
 
-    emit({ type: 'step', message: `AutoUpdate: Pulling ${config.repository}` });
+    emit({ type: 'step', message: `Pulling ${config.repository}` });
 
     await pullImage(config.repository, (event) => {
-      emit({
-        type: 'layer',
-        id: event.id,
-        status: event.status,
-        progress: event.progressDetail
-      });
+      emit({ type: 'layer', id: event.id, status: event.status, progress: event.progressDetail });
     });
 
-    appendLog(`AutoUpdate: Image pulled for ${name}`);
+    appendLog(`Image pulled: ${name}`);
     emit({ type: 'step', message: 'Stopping existing container...' });
 
-    // Find and stop existing container
     const containers = await listContainers();
-    const existing = containers.find(c => {
-      const cName = (c.Names?.[0] || '').replace(/^\//, '');
-      return cName === name;
-    });
+    const existing = containers.find(c => (c.Names?.[0] || '').replace(/^\//, '') === name);
 
     if (existing) {
-      if (existing.State === 'running') {
-        await stopContainer(existing.Id);
-      }
+      if (existing.State === 'running') await stopContainer(existing.Id);
       await removeContainer(existing.Id, { force: true });
     }
 
@@ -70,23 +66,31 @@ async function performUpdate(config, io) {
 
     const composeDir = join(DATA_DIR, 'compose', name);
     const { stdout, stderr } = await execAsync('docker compose up -d', { cwd: composeDir });
-    if (stdout) appendLog(`AutoUpdate [${name}]: ${stdout.trim()}`);
-    if (stderr) appendLog(`AutoUpdate [${name}]: ${stderr.trim()}`);
+    if (stdout) appendLog(`${name}: ${stdout.trim()}`);
+    if (stderr) appendLog(`${name}: ${stderr.trim()}`);
 
-    appendLog(`AutoUpdate: ${name} updated successfully`);
+    // Cleanup old images (equivalent to WATCHTOWER_CLEANUP=true)
+    try {
+      await pruneImages();
+    } catch (err) {
+      appendLog(`Image cleanup warning: ${err.message}`);
+    }
+
+    appendLog(`Update complete: ${name}`);
     emit({ type: 'complete', message: `${name} updated successfully` });
   } catch (err) {
-    appendLog(`AutoUpdate ERROR for ${name}: ${err.message}`);
+    appendLog(`Update ERROR for ${name}: ${err.message}`);
     emit({ type: 'error', message: err.message });
   }
 }
 
 export function scheduleAutoUpdates(io) {
   // Cancel any existing schedules
-  for (const [name, job] of scheduledJobs) {
-    job.stop();
-  }
+  for (const job of scheduledJobs.values()) job.stop();
   scheduledJobs.clear();
+
+  const settings = readSettings();
+  const defaultSchedule = settings.defaultSchedule || '0 3 * * *';
 
   let configs = [];
   try {
@@ -97,25 +101,25 @@ export function scheduleAutoUpdates(io) {
   }
 
   for (const config of configs) {
-    if (!config.autoUpdate) continue;
+    // Global enabled → schedule all containers on default (or per-container) schedule
+    // Global disabled → only schedule containers with explicit autoUpdate: true
+    const shouldSchedule = settings.autoUpdateEnabled || config.autoUpdate;
+    if (!shouldSchedule) continue;
 
-    const schedule = config.autoUpdateSchedule || '0 3 * * *';
+    const schedule = config.autoUpdateSchedule || defaultSchedule;
 
     if (!cron.validate(schedule)) {
-      appendLog(`AutoUpdate: Invalid cron schedule for ${config.name}: ${schedule}`);
+      appendLog(`AutoUpdate: Invalid schedule for ${config.name}: ${schedule}`);
       continue;
     }
 
-    appendLog(`AutoUpdate: Scheduling ${config.name} with cron: ${schedule}`);
-
     const job = cron.schedule(schedule, async () => {
       appendLog(`AutoUpdate: Triggered for ${config.name}`);
-      // Re-read config in case it changed
       try {
         const { listConfigs: lc } = await import('./xmlService.js');
-        const allConfigs = lc();
-        const freshConfig = allConfigs.find(c => c.name === config.name);
-        if (freshConfig && freshConfig.autoUpdate) {
+        const freshSettings = readSettings();
+        const freshConfig = lc().find(c => c.name === config.name);
+        if (freshConfig && (freshSettings.autoUpdateEnabled || freshConfig.autoUpdate)) {
           await performUpdate(freshConfig, io);
         }
       } catch (err) {
@@ -128,6 +132,24 @@ export function scheduleAutoUpdates(io) {
   }
 
   appendLog(`AutoUpdate: Scheduled ${scheduledJobs.size} container(s)`);
+}
+
+// Manually trigger update for a single container by name
+export async function runUpdateNow(configName, io) {
+  const configs = listConfigs();
+  const config = configs.find(c => c.name === configName);
+  if (!config) throw new Error(`Config not found: ${configName}`);
+  await performUpdate(config, io);
+}
+
+// Run updates for all managed containers immediately
+export async function runAllUpdates(io) {
+  const configs = listConfigs();
+  appendLog(`RunAll: Starting updates for ${configs.length} container(s)`);
+  for (const config of configs) {
+    await performUpdate(config, io);
+  }
+  appendLog('RunAll: All updates complete');
 }
 
 export async function runAutoStart() {
@@ -167,7 +189,6 @@ export async function runAutoStart() {
       continue;
     }
 
-    // Find container by name (might be stopped)
     const existing = runningContainers.find(c => {
       const cName = (c.Names?.[0] || '').replace(/^\//, '');
       return cName === config.name;

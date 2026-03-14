@@ -8,6 +8,7 @@ import * as dockerService from '../services/dockerService.js';
 import * as xmlService from '../services/xmlService.js';
 import { generateCompose, saveCompose } from '../services/composeGenerator.js';
 import { checkForUpdate } from '../services/updateChecker.js';
+import { runUpdateNow, runAllUpdates } from '../services/autoUpdate.js';
 
 const execAsync = promisify(exec);
 const router = Router();
@@ -40,6 +41,14 @@ function isExcluded(containerName, exclusions) {
 
 // In-memory update cache: { [id]: { hasUpdate, localDigest, remoteDigest, checkedAt } }
 const updateCache = {};
+
+function parseHealth(status) {
+  if (!status) return null;
+  if (status.includes('(healthy)')) return 'healthy';
+  if (status.includes('(unhealthy)')) return 'unhealthy';
+  if (status.includes('(health: starting)')) return 'starting';
+  return null;
+}
 
 // GET /api/containers — list all containers merged with XML configs
 router.get('/', async (req, res) => {
@@ -81,6 +90,8 @@ router.get('/', async (req, res) => {
           state: c.State,
           created: c.Created,
           ports: c.Ports,
+          labels: c.Labels || {},
+          health: parseHealth(c.Status),
           config: cfg,
           updateInfo: cached
         };
@@ -238,6 +249,98 @@ router.delete('/:id', async (req, res) => {
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
+});
+
+// GET /api/containers/:id/stats — single snapshot of CPU/mem/net stats
+router.get('/:id/stats', async (req, res) => {
+  try {
+    const raw = await dockerService.getStats(req.params.id);
+
+    // CPU %
+    const cpuDelta = raw.cpu_stats.cpu_usage.total_usage - raw.precpu_stats.cpu_usage.total_usage;
+    const systemDelta = raw.cpu_stats.system_cpu_usage - raw.precpu_stats.system_cpu_usage;
+    const numCpus = raw.cpu_stats.online_cpus || raw.cpu_stats.cpu_usage.percpu_usage?.length || 1;
+    const cpuPercent = systemDelta > 0 ? (cpuDelta / systemDelta) * numCpus * 100 : 0;
+
+    // Memory
+    const memUsed = raw.memory_stats.usage - (raw.memory_stats.stats?.cache || 0);
+    const memLimit = raw.memory_stats.limit;
+
+    // Network I/O (sum all interfaces)
+    let netRx = 0, netTx = 0;
+    for (const iface of Object.values(raw.networks || {})) {
+      netRx += iface.rx_bytes || 0;
+      netTx += iface.tx_bytes || 0;
+    }
+
+    res.json({
+      cpuPercent: Math.round(cpuPercent * 10) / 10,
+      memUsed,
+      memLimit,
+      memPercent: memLimit > 0 ? Math.round((memUsed / memLimit) * 1000) / 10 : 0,
+      netRx,
+      netTx,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/containers/check-updates — bulk update check, populates cache for all running containers
+router.post('/check-updates', async (req, res) => {
+  try {
+    const allContainers = await dockerService.listContainers();
+    const running = allContainers.filter(c => c.State === 'running');
+    res.json({ started: true, count: running.length });
+
+    // Run checks async after responding
+    for (const c of running) {
+      const image = c.Image;
+      if (!image) continue;
+      checkForUpdate(image)
+        .then(result => { updateCache[c.Id] = { ...result, checkedAt: Date.now() }; })
+        .catch(() => {});
+    }
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/containers/:name/update-now — manually trigger update for one container
+router.post('/:name/update-now', (req, res) => {
+  const name = req.params.name;
+  const io = req.app.get('io');
+  res.json({ success: true, message: 'Update started' });
+  runUpdateNow(name, io).catch(err => console.error(`Update error for ${name}:`, err.message));
+});
+
+// POST /api/containers/update-all — manually trigger updates for all containers
+router.post('/update-all', (req, res) => {
+  const io = req.app.get('io');
+  res.json({ success: true, message: 'Updates started for all containers' });
+  runAllUpdates(io).catch(err => console.error('Update all error:', err.message));
+});
+
+// POST /api/containers/bulk — bulk action on multiple containers
+router.post('/bulk', async (req, res) => {
+  const { action, ids } = req.body;
+  if (!action || !Array.isArray(ids) || ids.length === 0) {
+    return res.status(400).json({ error: 'action and ids[] required' });
+  }
+  const allowed = ['start', 'stop', 'restart'];
+  if (!allowed.includes(action)) {
+    return res.status(400).json({ error: `action must be one of: ${allowed.join(', ')}` });
+  }
+
+  const results = await Promise.allSettled(
+    ids.map(id => dockerService[`${action}Container`](id))
+  );
+
+  const errors = results
+    .map((r, i) => r.status === 'rejected' ? { id: ids[i], error: r.reason?.message } : null)
+    .filter(Boolean);
+
+  res.json({ success: errors.length === 0, errors });
 });
 
 // POST /api/containers/:name/deploy — pull + deploy

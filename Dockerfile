@@ -30,9 +30,10 @@ COPY backend/ ./
 # Copy built frontend from stage 1
 COPY --from=frontend-builder /build/frontend/dist ./frontend/dist
 
-# Add node user to docker group (GID 988 matches host docker group)
-# and create non-root user directories
-RUN addgroup -g 988 docker 2>/dev/null || true && \
+# Add node user to the docker group so it can talk to the Docker socket.
+# Pass --build-arg DOCKER_GID=$(getent group docker | cut -d: -f3) to match your host.
+ARG DOCKER_GID=999
+RUN addgroup -g ${DOCKER_GID} docker 2>/dev/null || true && \
     addgroup node docker && \
     mkdir -p /home/bosun && \
     chown -R node:node /home/bosun /app
